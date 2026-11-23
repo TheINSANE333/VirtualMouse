@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::descriptors::{get_string_descriptor, DEV_DESC, FULL_CONFIG_DESC, HID_REPORT_DESC};
+use crate::logger::Logger;
 
 pub const USBIP_PORT: u16 = 3240;
 pub const USBIP_VERSION: u16 = 0x0111;
@@ -33,34 +34,63 @@ pub struct UsbIpServer {
     pub port: u16,
     pub is_running: Arc<AtomicBool>,
     pub is_connected: Arc<AtomicBool>,
+    pub is_captured: Arc<AtomicBool>,
+    pub is_counting_down: Arc<AtomicBool>,
     pub packets_sent: Arc<AtomicU64>,
+    pub logger: Arc<Logger>,
 }
 
 impl UsbIpServer {
-    pub fn new(host: &str, port: u16) -> Self {
+    pub fn new(
+        host: &str,
+        port: u16,
+        is_captured: Arc<AtomicBool>,
+        is_counting_down: Arc<AtomicBool>,
+        logger: Arc<Logger>,
+    ) -> Self {
         Self {
             host: host.to_string(),
             port,
             is_running: Arc::new(AtomicBool::new(true)),
             is_connected: Arc::new(AtomicBool::new(false)),
+            is_captured,
+            is_counting_down,
             packets_sent: Arc::new(AtomicU64::new(0)),
+            logger,
         }
     }
 
     pub fn start(&self, mouse_rx: Receiver<MouseReport>) {
+        // Start UDP auto-discovery responder on the same port
+        let is_running_udp = self.is_running.clone();
+        let udp_port = self.port;
+        std::thread::spawn(move || {
+            if let Ok(socket) = std::net::UdpSocket::bind(format!("0.0.0.0:{}", udp_port)) {
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buf = [0u8; 64];
+                while is_running_udp.load(Ordering::Relaxed) {
+                    if let Ok((len, src)) = socket.recv_from(&mut buf) {
+                        let msg = String::from_utf8_lossy(&buf[..len]);
+                        if msg.starts_with("VM_DISCOVER") {
+                            let _ = socket.send_to(b"VM_OFFER", src);
+                        }
+                    }
+                }
+            }
+        });
+
         let addr = format!("{}:{}", self.host, self.port);
         let listener = match TcpListener::bind(&addr) {
             Ok(l) => {
-                println!("[USB/IP Server] Listening on {}...", addr);
+                self.logger.log("USBIP", &format!("Listening on {}...", addr));
                 l
             }
             Err(e) => {
-                eprintln!("[!] Failed to bind TCP listener on {}: {}", addr, e);
+                self.logger.log("USBIP_ERR", &format!("Failed to bind TCP listener on {}: {}", addr, e));
                 return;
             }
         };
 
-        // Channel receiver needs to be shared or handled when client connects
         let mouse_rx = Arc::new(std::sync::Mutex::new(mouse_rx));
 
         while self.is_running.load(Ordering::SeqCst) {
@@ -76,32 +106,49 @@ impl UsbIpServer {
                     let _status = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
 
                     if version != USBIP_VERSION && version != 0x0106 {
-                        eprintln!("[USB/IP] Unsupported protocol version: 0x{:04X}", version);
+                        self.logger.log("USBIP_ERR", &format!("Unsupported protocol version: 0x{:04X} from {}", version, peer_addr));
                         continue;
                     }
 
                     match opcode {
                         OP_REQ_DEVLIST => {
+                            self.logger.log_file_only("USBIP", &format!("Received OP_REQ_DEVLIST from {}", peer_addr));
                             self.handle_devlist(&mut stream);
                         }
                         OP_REQ_IMPORT => {
                             let mut busid_buf = [0u8; 32];
                             if stream.read_exact(&mut busid_buf).is_ok() {
-                                println!("\n[USB/IP] Host connected from {}! Importing mouse...", peer_addr);
+                                let busid = String::from_utf8_lossy(&busid_buf)
+                                    .trim_matches(char::from(0))
+                                    .to_string();
+
+                                self.logger.log("USBIP", &format!("Host connected from {}! Importing device busid '{}'...", peer_addr, busid));
                                 self.is_connected.store(true, Ordering::SeqCst);
 
                                 let is_connected = self.is_connected.clone();
+                                let is_captured = self.is_captured.clone();
+                                let is_counting_down = self.is_counting_down.clone();
                                 let packets_sent = self.packets_sent.clone();
                                 let is_running = self.is_running.clone();
                                 let rx_clone = mouse_rx.clone();
+                                let log = self.logger.clone();
 
                                 std::thread::spawn(move || {
-                                    Self::handle_import(stream, rx_clone, is_connected, packets_sent, is_running);
+                                    Self::handle_import(
+                                        stream,
+                                        rx_clone,
+                                        is_connected,
+                                        is_captured,
+                                        is_counting_down,
+                                        packets_sent,
+                                        is_running,
+                                        log,
+                                    );
                                 });
                             }
                         }
                         _ => {
-                            eprintln!("[USB/IP] Unknown opcode: 0x{:04X}", opcode);
+                            self.logger.log("USBIP_ERR", &format!("Unknown opcode: 0x{:04X}", opcode));
                         }
                     }
                 }
@@ -109,7 +156,7 @@ impl UsbIpServer {
                     if !self.is_running.load(Ordering::SeqCst) {
                         break;
                     }
-                    eprintln!("[USB/IP] Accept error: {}", e);
+                    self.logger.log("USBIP_ERR", &format!("Accept error: {}", e));
                 }
             }
         }
@@ -160,8 +207,11 @@ impl UsbIpServer {
         mut stream: TcpStream,
         mouse_rx: Arc<std::sync::Mutex<Receiver<MouseReport>>>,
         is_connected: Arc<AtomicBool>,
+        is_captured: Arc<AtomicBool>,
+        is_counting_down: Arc<AtomicBool>,
         packets_sent: Arc<AtomicU64>,
         is_running: Arc<AtomicBool>,
+        logger: Arc<Logger>,
     ) {
         // Send OP_REP_IMPORT
         let mut resp = Vec::with_capacity(8 + 312);
@@ -171,12 +221,12 @@ impl UsbIpServer {
         resp.extend_from_slice(&Self::build_device_info());
 
         if let Err(e) = stream.write_all(&resp) {
-            eprintln!("[USB/IP] Failed to send OP_REP_IMPORT: {}", e);
+            logger.log("USBIP_ERR", &format!("Failed to send OP_REP_IMPORT: {}", e));
             is_connected.store(false, Ordering::SeqCst);
             return;
         }
 
-        println!("[USB/IP] Device imported! Host attached successfully.");
+        logger.log("USBIP", "Device imported! Host attached successfully.");
 
         let mut last_buttons = 0u8;
 
@@ -206,10 +256,10 @@ impl UsbIpServer {
 
                 if ep == 0 {
                     // Control URB
-                    Self::handle_control_urb(&mut stream, seqnum, length, setup);
+                    Self::handle_control_urb(&mut stream, seqnum, length, setup, &logger);
                 } else if ep == 1 && direction == 1 {
                     // Mouse Interrupt IN URB
-                    Self::handle_mouse_urb(&mut stream, seqnum, length, &mouse_rx, &mut last_buttons, &packets_sent);
+                    Self::handle_mouse_urb(&mut stream, seqnum, length, &mouse_rx, &mut last_buttons, &packets_sent, &logger);
                 } else {
                     Self::send_ret_submit(&mut stream, seqnum, 0, &[]);
                 }
@@ -221,16 +271,28 @@ impl UsbIpServer {
                     break;
                 }
             } else {
-                eprintln!("[USB/IP] Unknown URB command: 0x{:08X}", cmd);
+                logger.log("USBIP_ERR", &format!("Unknown URB command: 0x{:08X}", cmd));
                 break;
             }
         }
 
-        println!("[USB/IP] Host disconnected.");
+        logger.log("USBIP", "Host disconnected.");
         is_connected.store(false, Ordering::SeqCst);
+
+        // Cancel countdown if it was in progress
+        if is_counting_down.swap(false, Ordering::SeqCst) {
+            logger.log("CAPTURE", "Host disconnected! Countdown cancelled.");
+        }
+
+        // Auto-release mouse capture back to local Server PC
+        if is_captured.swap(false, Ordering::SeqCst) {
+            logger.log("CAPTURE", "Host disconnected! Automatically returned mouse control to local Server PC.");
+            crate::capture::sound_beep(600, 100);
+            crate::capture::sound_beep(400, 150);
+        }
     }
 
-    fn handle_control_urb(stream: &mut TcpStream, seqnum: u32, length: i32, setup: &[u8]) {
+    fn handle_control_urb(stream: &mut TcpStream, seqnum: u32, length: i32, setup: &[u8], logger: &Arc<Logger>) {
         let bm_request_type = setup[0];
         let b_request = setup[1];
         let w_value = u16::from_le_bytes([setup[2], setup[3]]);
@@ -248,18 +310,29 @@ impl UsbIpServer {
                     let desc_type = (w_value >> 8) as u8;
                     let desc_index = (w_value & 0xFF) as u8;
                     match desc_type {
-                        1 => payload.extend_from_slice(&DEV_DESC),
-                        2 => payload.extend_from_slice(&FULL_CONFIG_DESC),
-                        3 => payload.extend_from_slice(&get_string_descriptor(desc_index)),
-                        0x22 => payload.extend_from_slice(HID_REPORT_DESC),
+                        1 => {
+                            logger.log_file_only("EP0", "GET_DESCRIPTOR (Device) -> 18 bytes");
+                            payload.extend_from_slice(&DEV_DESC);
+                        }
+                        2 => {
+                            logger.log_file_only("EP0", "GET_DESCRIPTOR (Configuration) -> 34 bytes");
+                            payload.extend_from_slice(&FULL_CONFIG_DESC);
+                        }
+                        3 => {
+                            logger.log_file_only("EP0", &format!("GET_DESCRIPTOR (String index {})", desc_index));
+                            payload.extend_from_slice(&get_string_descriptor(desc_index));
+                        }
+                        0x22 => {
+                            logger.log_file_only("EP0", "GET_DESCRIPTOR (HID Report) -> 62 bytes");
+                            payload.extend_from_slice(HID_REPORT_DESC);
+                        }
                         _ => {}
                     }
                 }
                 0x09 => {
-                    // SET_CONFIGURATION
+                    logger.log_file_only("EP0", "SET_CONFIGURATION -> Success");
                 }
                 0x00 => {
-                    // GET_STATUS
                     payload.extend_from_slice(&[0x00, 0x00]);
                 }
                 _ => {}
@@ -268,15 +341,12 @@ impl UsbIpServer {
             // HID Class Request
             match b_request {
                 0x0A => {
-                    // SET_IDLE
+                    logger.log_file_only("EP0", "SET_IDLE -> Success");
                 }
                 0x01 => {
-                    // GET_REPORT
                     payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
                 }
-                0x09 => {
-                    // SET_REPORT
-                }
+                0x09 => {}
                 _ => {}
             }
         }
@@ -294,13 +364,21 @@ impl UsbIpServer {
         length: i32,
         mouse_rx: &Arc<std::sync::Mutex<Receiver<MouseReport>>>,
         last_buttons: &mut u8,
-        packets_sent: &Arc<AtomicU64>,
+        _packets_sent: &Arc<AtomicU64>,
+        _logger: &Arc<Logger>,
     ) {
         let mut report_bytes = [*last_buttons, 0, 0, 0];
 
         // Wait up to 8ms for incoming mouse event (125Hz polling rate)
         if let Ok(rx) = mouse_rx.lock() {
-            if let Ok(report) = rx.recv_timeout(Duration::from_millis(8)) {
+            if let Ok(mut report) = rx.recv_timeout(Duration::from_millis(8)) {
+                // Drain and coalesce any queued reports so movement is zero-latency & smooth
+                while let Ok(next) = rx.try_recv() {
+                    report.dx = ((report.dx as i16) + (next.dx as i16)).clamp(-127, 127) as i8;
+                    report.dy = ((report.dy as i16) + (next.dy as i16)).clamp(-127, 127) as i8;
+                    report.wheel = ((report.wheel as i16) + (next.wheel as i16)).clamp(-127, 127) as i8;
+                    report.buttons = next.buttons;
+                }
                 *last_buttons = report.buttons;
                 report_bytes = [
                     report.buttons,
@@ -308,7 +386,6 @@ impl UsbIpServer {
                     report.dy as u8,
                     report.wheel as u8,
                 ];
-                packets_sent.fetch_add(1, Ordering::Relaxed);
             }
         }
 

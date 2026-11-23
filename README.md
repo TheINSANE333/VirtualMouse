@@ -82,7 +82,7 @@ Options:
 
 ---
 
-### Step 3: Connect on the Host PC
+### Step 3: Connect on the Host PC (Ethernet or Wi-Fi)
 
 On the **Host PC**, double-click:
 
@@ -92,10 +92,14 @@ VirtualMouseHost.exe
 
 *(Or run `attach.bat`)*
 
-1. It will prompt for the Server PC's IP address (press Enter for `127.0.0.1` or type the remote IP).
-2. It attaches the USB mouse (`busid 1-1`) to Windows.
-3. Windows Device Manager registers a new **"HID-compliant mouse"**.
-4. Pressing `[Enter]` or `Ctrl+C` in `VirtualMouseHost.exe` cleanly detaches the USB mouse before exiting.
+1. `VirtualMouseHost.exe` displays your local network adapters (Ethernet, Wi-Fi).
+2. It automatically probes the network via UDP broadcast and detects your running `VirtualMouseServer.exe` on **Ethernet**!
+3. Simply press **`[Enter]`** to connect to the discovered Ethernet IP (or type the remote IP).
+4. Windows Device Manager registers a genuine **"HID-compliant mouse"**.
+5. When the Host PC disconnects, the Server PC automatically restores local mouse control without needing to press **`F12`**.
+
+> **Note for Direct Ethernet Cables (Peer-to-Peer without router):**
+> If connecting directly via an Ethernet cable between both PCs, right-click and run `allow_firewall.bat` as Administrator on the Server PC. This ensures Windows Firewall permits direct Ethernet traffic even when Windows labels the cable as an "Unidentified / Public" network.
 
 ---
 
@@ -106,6 +110,14 @@ VirtualMouseHost.exe
 3. You will hear 5 countdown beeps (1 per second). Use this time to switch into and focus your full-screen Remote Desktop window.
 4. On the final high chime, mouse capture activates! Your physical mouse movements stream directly to the Host PC.
 5. Press **`F12`** again anytime to immediately release mouse control back to the Server PC.
+
+---
+
+## High Performance & Zero Resource Overhead
+
+- **High-Speed Pure Raw Input:** Processes mouse deltas directly from the USB optical hardware sensor with zero latency and zero CPU overhead.
+- **Zero Disk Logging:** File logging is completely disabled to eliminate disk I/O latency and mutex lock contention during high-frequency mouse movements.
+- **Automatic Disconnect Release:** When the Host PC disconnects, the Server automatically restores local mouse control to the Server PC without requiring manual hotkey intervention.
 
 ---
 

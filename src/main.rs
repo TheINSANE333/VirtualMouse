@@ -1,30 +1,50 @@
 mod capture;
 mod descriptors;
+mod logger;
+mod net_util;
 mod usbip;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 
-use capture::start_raw_input_loop;
+use capture::start_capture_engine;
+use logger::Logger;
 use usbip::{MouseReport, UsbIpServer, USBIP_PORT};
 
 fn print_banner(host: &str, port: u16, delay: u64) {
     println!("\n==================================================================");
     println!("  VirtualMouse USB/IP Server (Native Rust VirtualHere Engine)");
-    println!("  ZERO GUI WINDOWS | NO CURSOR WARPING | PURE HARDWARE DELTAS");
+    println!("  ZERO GUI WINDOWS | HARDWARE RAW INPUT | ZERO-LATENCY STREAMING");
     println!("==================================================================");
-    println!("  Server Address : {}:{}", host, port);
+    println!("  Server Port    : {} (TCP + UDP Auto-Discovery)", port);
     println!("  Countdown Delay: {} seconds", delay);
     println!("  Toggle Keys    : [ F12 ] or [ F11 ] or [ Scroll Lock ]");
     println!("                   (or simply press [Enter] in this console)");
     println!("==================================================================");
+
+    let adapters = net_util::get_local_adapters();
+    if !adapters.is_empty() {
+        println!("  Available Network Addresses:");
+        for a in &adapters {
+            if a.is_ethernet {
+                println!("    • [Ethernet] {}:{}  <-- (RECOMMENDED: Lowest Latency)", a.ip, port);
+            } else {
+                println!("    • [{}]    {}:{}", a.name, a.ip, port);
+            }
+        }
+    } else {
+        println!("  Server Address : {}:{}", host, port);
+    }
+
+    println!("==================================================================");
     println!("  Workflow:");
-    println!("  1. Connect Host PC via usbip attach");
+    println!("  1. Connect Host PC via VirtualMouseHost.exe (or attach.bat)");
     println!("  2. Press [ F12 ] -> hear {} countdown beeps", delay);
     println!("  3. Switch to your full-screen Remote Desktop window");
     println!("  4. When you hear the high chime, your physical mouse is mapped!");
     println!("  5. Press [ F12 ] again anytime to release mouse back to server.");
+    println!("     (Disconnecting from Host PC will also auto-release the mouse)");
     println!("==================================================================\n");
 }
 
@@ -60,7 +80,7 @@ fn main() {
                 }
             }
             "--help" | "-h" => {
-                println!("Usage: virtual_mouse_server [OPTIONS]");
+                println!("Usage: VirtualMouseServer.exe [OPTIONS]");
                 println!("Options:");
                 println!("  --host <IP>      Bind address (default: 0.0.0.0)");
                 println!("  --port <PORT>    Bind port (default: 3240)");
@@ -72,6 +92,9 @@ fn main() {
         i += 1;
     }
 
+    let logger = Arc::new(Logger::new("server.log"));
+    logger.log("MAIN", &format!("Server starting on {}:{}, countdown delay: {}s", host, port, delay));
+
     print_banner(&host, port, delay);
 
     let is_running = Arc::new(AtomicBool::new(true));
@@ -80,8 +103,9 @@ fn main() {
 
     // Handle Ctrl+C
     let r = is_running.clone();
+    let log_c = logger.clone();
     let _ = ctrlc_handler(move || {
-        println!("\n[!] Shutting down VirtualMouse server...");
+        log_c.log("MAIN", "Shutdown signal received (Ctrl+C). Cleaning up...");
         r.store(false, Ordering::SeqCst);
         std::process::exit(0);
     });
@@ -89,21 +113,23 @@ fn main() {
     let (mouse_tx, mouse_rx) = sync_channel::<MouseReport>(2048);
 
     // Spawn USB/IP Server in background thread
-    let mut server = UsbIpServer::new(&host, port);
+    let server = UsbIpServer::new(&host, port, is_captured.clone(), is_counting_down.clone(), logger.clone());
     let s_running = is_running.clone();
+    let mut server = server;
     server.is_running = s_running;
 
     std::thread::spawn(move || {
         server.start(mouse_rx);
     });
 
-    // Run Raw Input Window Message Pump on main thread
-    start_raw_input_loop(
+    // Run Capture Engine (Hook + Window message pump) on main thread
+    start_capture_engine(
         mouse_tx,
         is_captured,
         is_counting_down,
         is_running,
         delay,
+        logger,
     );
 }
 

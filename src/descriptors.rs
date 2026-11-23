@@ -64,8 +64,8 @@ pub const FULL_CONFIG_DESC: [u8; 34] = [
     9, 0x02, 34, 0x00, 1, 1, 0, 0xA0, 50,
     // Interface Descriptor (9 bytes): Class 3 (HID), SubClass 1 (Boot), Protocol 2 (Mouse)
     9, 0x04, 0, 0, 1, 0x03, 0x01, 0x02, 0,
-    // HID Descriptor (9 bytes): Report Descriptor length = 52 (0x0034)
-    9, 0x21, 0x11, 0x01, 0x00, 1, 0x22, 52, 0x00,
+    // HID Descriptor (9 bytes): Report Descriptor length = 62 (0x003E)
+    9, 0x21, 0x11, 0x01, 0x00, 1, 0x22, 62, 0x00,
     // Endpoint Descriptor (7 bytes): EP 1 IN (0x81), Interrupt (0x03), max packet 64, interval 1ms
     7, 0x05, 0x81, 0x03, 64, 0x00, 1,
 ];
