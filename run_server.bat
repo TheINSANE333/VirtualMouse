@@ -1,16 +1,20 @@
 @echo off
-echo Starting VirtualMouse Server...
-echo Choose Mode:
-echo [1] Interactive Capture Window (Default)
-echo [2] Test Mode (Auto circle motion)
-echo [3] Headless Mode (Background server)
-set /p MODE="Select mode [1/2/3]: "
+setlocal
+cd /d "%~dp0"
+set PATH=%USERPROFILE%\.cargo\bin;%PATH%
 
-if "%MODE%"=="2" (
-    python server.py --test
-) else if "%MODE%"=="3" (
-    python server.py --headless
+if exist "VirtualMouseServer.exe" (
+    VirtualMouseServer.exe %*
+) else if exist "target\release\virtual_mouse_server.exe" (
+    target\release\virtual_mouse_server.exe %*
 ) else (
-    python server.py
+    echo [!] Server executable not found. Building now...
+    cargo build --release
+    if exist "target\release\virtual_mouse_server.exe" (
+        copy target\release\virtual_mouse_server.exe VirtualMouseServer.exe /Y
+        VirtualMouseServer.exe %*
+    ) else (
+        echo [!] Build failed.
+        pause
+    )
 )
-pause
